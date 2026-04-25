@@ -1,0 +1,69 @@
+# ITC2019 Post-Optimization Configuration
+
+instance: agh-ggis-spr17
+data_dir: data/reduced
+solutions_dir: data/solutions
+output_dir: output
+device: cuda:0           # cuda:0 | cpu
+matrix: false            # matrix=False is lighter and enough for post-optimization
+
+# -----------------------------------------------------------------------
+method: merging          # merging | local_search | lns | tensor_search
+# -----------------------------------------------------------------------
+
+merging:
+  strategy: crossover    # greedy | frequency | improve_from_best | crossover
+  # candidate_source / scoring used by greedy / improve_from_best strategies:
+  candidate_source: pool_only
+  scoring: combined
+  freq_weight: 0.3
+  sort_classes: most_constrained
+  num_passes: 3
+  # crossover-specific settings:
+  top_k: 10              # number of best-pool solutions used as parents
+  num_offspring: 500     # crossover trials per run
+  seed: 42               # random seed for reproducibility
+  validate: true         # submit best result to official validator after run
+
+local_search:
+  max_iter: 50000
+  neighborhood: single_class    # single_class | room_swap
+  acceptance: sa                # best_improvement | first_improvement | sa
+  sa_temperature: 500.0
+  sa_cooling: 0.9995
+  restart_from_best: true
+  validate: true
+
+lns:
+  max_iter: 500
+  destroy_size: 8
+  destroy_strategy: mixed   # random | high_distribution | mixed
+  mixed_high_distribution_prob: 0.7
+  repair_method: beam       # greedy | beam
+  beam_width: 3
+  repair_scoring: validator_delta   # validator_delta | local
+  repair_candidate_limit: 40
+  acceptance: improvement   # improvement | sa
+  temperature: 100.0
+  cooling: 0.995
+  seed: 42
+  validate: true
+
+tensor_search:
+  steps: 500
+  lr: 0.05
+  temperature: 1.0
+  cooling: 0.995
+  min_temperature: 0.1
+  eval_every: 10
+  log_every: 50
+  init_bias: 6.0
+  init_noise: 0.01
+  hard_weight: 10000.0
+  entropy_weight: 0.001
+  sample_count: 2
+  sample_noise: 0.5
+  max_gradient_moves: 8
+  gradient_options_per_class: 1
+  seed: 42
+  validate: false

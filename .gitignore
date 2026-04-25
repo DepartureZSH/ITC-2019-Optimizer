@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local/editor state
+.claude/
+.idea/
+.vscode/
+*.log
+
+# Runtime outputs
+output/*
+!output/analysis/
+!output/analysis/tensor_search_memory_estimate.csv
+
+# Local secrets
+.env
+.env.*
+secrets.*
+
+# OS noise
+Thumbs.db
+.DS_Store
