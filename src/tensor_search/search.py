@@ -31,11 +31,16 @@ class TensorGradientSearch:
         self.time_weight = float(evaluator.time_weight)
         self.room_weight = float(evaluator.room_weight)
         self.dist_weight = float(evaluator.dist_weight)
-        self.hard_weight = float(cfg.get("hard_weight", 10000.0))
+        self.hard_weight = float(cfg.get("hard_weight", 0.0))
+        self.hard_surrogate = str(cfg.get("hard_surrogate", "none")).lower()
         self.entropy_weight = float(cfg.get("entropy_weight", 0.001))
 
         self.class_domains = self._build_class_domains()
         self.cid_order = sorted(self.class_domains.keys(), key=self._sort_key)
+        self.class_domain_tensors = {
+            cid: torch.tensor(self.class_domains[cid], dtype=torch.long, device=self.device)
+            for cid in self.cid_order
+        }
 
     def _sort_key(self, value: str):
         try:
@@ -65,11 +70,18 @@ class TensorGradientSearch:
         entropy = torch.zeros((), dtype=torch.float32, device=self.device)
         temp = max(float(temperature), 1e-6)
         for cid in self.cid_order:
-            idx = torch.tensor(self.class_domains[cid], dtype=torch.long, device=self.device)
+            idx = self.class_domain_tensors[cid]
             probs = torch.softmax(logits[idx] / temp, dim=0)
             x_soft[idx] = probs
             entropy = entropy - torch.sum(probs * torch.log(probs.clamp_min(1e-12)))
         return x_soft, entropy
+
+    def _use_full_hard_surrogate(self) -> bool:
+        return (
+            self.hard_weight > 0.0
+            and self.hard_surrogate in {"full", "full_sparse", "sparse"}
+            and self.c.hard_dist_tensor._nnz() > 0
+        )
 
     def _surrogate_loss(self, x_soft: torch.Tensor, entropy: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
         time_pen = torch.dot(x_soft, self.w_time) * self.time_weight
@@ -81,7 +93,7 @@ class TensorGradientSearch:
         else:
             soft_pen = torch.zeros((), dtype=torch.float32, device=self.device)
 
-        if self.c.hard_dist_tensor._nnz() > 0:
+        if self._use_full_hard_surrogate():
             hard_activity = torch.sparse.mm(self.c.hard_dist_tensor, x_soft.unsqueeze(1)).squeeze(1)
             hard_upper = self.c.hard_dist_upper_tensor.squeeze(0).float()
             hard_violation = (hard_activity - hard_upper).clamp(min=0.0)
@@ -104,7 +116,7 @@ class TensorGradientSearch:
         if noise_scale > 0:
             scores = scores + torch.randn_like(scores) * noise_scale
         for cid in self.cid_order:
-            idx = torch.tensor(self.class_domains[cid], dtype=torch.long, device=self.device)
+            idx = self.class_domain_tensors[cid]
             best_pos = int(torch.argmax(scores[idx]).item())
             x[idx[best_pos]] = 1.0
         return x
@@ -279,7 +291,8 @@ def run_tensor_search(
         f"lr={cfg.get('lr', 0.05)}  "
         f"temperature={cfg.get('temperature', 1.0)}  "
         f"eval_every={cfg.get('eval_every', 10)}  "
-        f"sample_count={cfg.get('sample_count', 2)}"
+        f"sample_count={cfg.get('sample_count', 2)}  "
+        f"hard_surrogate={cfg.get('hard_surrogate', 'none')}"
     )
 
     if not pool_data:

@@ -59,7 +59,10 @@ tensor_search:
   log_every: 50
   init_bias: 6.0
   init_noise: 0.01
-  hard_weight: 10000.0
+  # Keep the continuous surrogate memory-safe on large instances.
+  # Hard feasibility is enforced by validator-checked discrete probes.
+  hard_surrogate: none        # none | full_sparse
+  hard_weight: 0.0            # set >0 only with hard_surrogate=full_sparse on small/very-large-GPU runs
   entropy_weight: 0.001
   sample_count: 2
   sample_noise: 0.5

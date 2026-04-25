@@ -2,12 +2,24 @@
 
 估算对象是当前 `src/tensor_search` + `ConstraintsResolver_v2` 路径：先构建 x 变量、valid/hard/soft sparse tensors，再创建 logits、gradient、Adam state 和 soft assignment。单位为 GiB，可近似理解为 G。
 
+更新说明：下面表格是“常驻张量 + 粗略峰值”的静态估算，不包含 CUDA `torch.sparse.mm(hard_dist_tensor, x_soft)` 在反向传播中的额外 workspace。`muni-fsps-spr17c` 的真实运行已经证明，旧的 full hard surrogate 会显著超过这个估算。
+
 ## 口径
 
 - `steady`: 训练中张量常驻显存/内存估算。
 - `peak`: `steady × 1.6`，考虑 sparse 构建临时张量、autograd 临时量和 allocator 碎片。
-- `recommended`: `steady × 2.0`，建议显存余量。实际跑 CUDA 时最好按这一列看。
+- `recommended`: `steady × 2.0`，原始建议显存余量。对于 full hard sparse surrogate，大实例应额外保留 sparse.mm workspace。
 - `as-is CPU risk`: 当前 `ConstraintsResolver_v2` 构建 room-capacity 时 Python dict/list/cache 的粗略 CPU 额外开销估计，不是 GPU 显存；大实例会先卡在这里。
+
+## 真实 OOM 观测
+
+`muni-fsps-spr17c` 在 24 GiB GPU 上构建模型成功，但旧版 tensor search 在第一步 full hard sparse surrogate 处 OOM：
+
+- 模型构建后进程已占用约 `21.01 GiB`。
+- `torch.sparse.mm(hard_dist_tensor, x_soft)` 额外申请 `5.03 GiB`。
+- 因此旧模式最低峰值已经超过 `26.04 GiB`，考虑碎片和 allocator reserve 后应按 `32 GiB+` 看。
+
+当前默认配置已改为 `hard_surrogate: none`、`hard_weight: 0.0`：连续松弛不再做完整 hard sparse.mm，硬约束由离散 probe 后的 official-aligned local validator 保证。这样 24 GiB 上有机会继续跑 `muni-fsps-spr17c`，但模型常驻仍接近 21 GiB，建议设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 并清空其他 GPU 进程。
 
 ## 结果表
 
@@ -32,8 +44,8 @@
 ## 结论
 
 - 显存压力主要来自 room-capacity hard sparse tensor，而不是梯度 logits 本身。
-- `lums-spr18` 和 `muni-fsps-spr17c` 是高风险实例，推荐显存分别约 22.79G 和 13.99G；但当前 as-is 构建方式的 CPU Python 对象开销可能更早成为瓶颈。
+- `lums-spr18` 和 `muni-fsps-spr17c` 是高风险实例；旧的 full hard sparse surrogate 对 `muni-fsps-spr17c` 至少需要 26G+ 峰值，实际建议 32G+。
 - 小实例如 `muni-*`, `pu-d5`, `tg-*` 的张量显存需求很低，通常 1G 内足够；但构建时间仍可能受约束生成影响。
-- 如果要真正大规模跑 tensor search，下一步应重写 room-capacity 构建为 streaming COO 或不显式展开所有 room conflict pairs。
+- 如果要真正大规模跑 tensor search，下一步应重写 room-capacity 构建为 streaming COO，或不要在 GPU 上显式展开所有 room conflict pairs，把硬约束保持在 validator / incremental cache 路径。
 
 CSV 明细：`output/analysis/tensor_search_memory_estimate.csv`
