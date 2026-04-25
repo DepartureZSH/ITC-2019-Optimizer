@@ -20,6 +20,7 @@ env/
 output/*
 !output/analysis/
 !output/analysis/tensor_search_memory_estimate.csv
+*.bundle
 
 # Local secrets
 .env
