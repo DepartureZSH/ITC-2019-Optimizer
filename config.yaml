@@ -37,8 +37,16 @@ local_search:
 lns:
   max_iter: 500
   destroy_size: 8
-  destroy_strategy: mixed   # random | high_distribution | mixed
+  destroy_strategy: marl_guided   # random | high_distribution | mixed | marl_guided
   mixed_high_distribution_prob: 0.7
+  marl_alpha: 0.2
+  marl_epsilon: 0.1
+  marl_temperature: 1.0
+  marl_q_weight: 1.0
+  marl_distribution_weight: 0.7
+  marl_local_weight: 0.2
+  marl_difficulty_weight: 0.1
+  marl_failed_reward: 0.02
   repair_method: beam       # greedy | beam
   beam_width: 3
   repair_scoring: validator_delta   # validator_delta | local

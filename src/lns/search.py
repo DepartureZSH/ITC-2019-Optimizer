@@ -42,7 +42,9 @@ class LargeNeighborhoodSearch:
         for row_idx, constraint in enumerate(self._soft_constraints):
             for cid in constraint.get("classes", []):
                 self._cid_to_soft_rows[cid].append(row_idx)
-        self.destroy_stats = {"random": 0, "high_distribution": 0, "fallback": 0}
+        self.destroy_stats = {"random": 0, "high_distribution": 0, "marl_guided": 0, "fallback": 0}
+        self._marl_q: Dict[str, float] = defaultdict(float)
+        self._marl_count: Dict[str, int] = defaultdict(int)
 
     def _class_map(self, x_tensor: torch.Tensor) -> Dict[str, int]:
         result = {}
@@ -187,6 +189,13 @@ class LargeNeighborhoodSearch:
             high_prob = float(self.cfg.get("mixed_high_distribution_prob", 0.7))
             strategy = "high_distribution" if random.random() < high_prob else "random"
 
+        if strategy in {"marl", "marl_guided"}:
+            cids = self._marl_guided_classes(x_current, class_to_xidx, destroy_size)
+            if cids:
+                self.destroy_stats["marl_guided"] += 1
+                return cids
+            self.destroy_stats["fallback"] += 1
+
         if strategy == "high_distribution":
             cids = self._high_distribution_classes(x_current, class_to_xidx, destroy_size)
             if cids:
@@ -229,6 +238,79 @@ class LargeNeighborhoodSearch:
             selected.extend(random.sample(remaining, min(destroy_size - len(selected), len(remaining))))
 
         return selected
+
+    def _marl_guided_classes(
+        self,
+        x_current: torch.Tensor,
+        class_to_xidx: Dict[str, int],
+        destroy_size: int,
+    ) -> List[str]:
+        """
+        Lightweight MARL-style destroy policy.
+
+        Each class acts as an independent agent with a learned Q preference.
+        A centralized scorer mixes Q with current validator-derived features,
+        then samples a cooperative destroy set. Rewards are assigned back to
+        the selected class agents after repair/evaluation in search().
+        """
+        cids = list(class_to_xidx.keys())
+        if not cids:
+            return []
+        if destroy_size >= len(cids):
+            return cids
+
+        epsilon = float(self.cfg.get("marl_epsilon", 0.10))
+        if random.random() < epsilon:
+            return random.sample(cids, destroy_size)
+
+        validator = getattr(self.ev, "local_validator", None)
+        soft_scores = validator.soft_violation_class_scores_from_x(x_current, self.c) if validator else {}
+        max_soft = max(soft_scores.values(), default=0.0)
+
+        local_scores = {cid: self._local_score(xidx) for cid, xidx in class_to_xidx.items()}
+        max_local = max(local_scores.values(), default=0.0)
+
+        q_weight = float(self.cfg.get("marl_q_weight", 1.0))
+        dist_weight = float(self.cfg.get("marl_distribution_weight", 0.7))
+        local_weight = float(self.cfg.get("marl_local_weight", 0.2))
+        difficulty_weight = float(self.cfg.get("marl_difficulty_weight", 0.1))
+        temperature = max(float(self.cfg.get("marl_temperature", 1.0)), 1e-6)
+
+        scored = []
+        for cid in cids:
+            q = self._marl_q[cid]
+            soft = soft_scores.get(cid, 0.0) / max(max_soft, 1e-9)
+            local = local_scores.get(cid, 0.0) / max(max_local, 1e-9)
+            domain_size = max(len(self._cid_domain.get(cid, [])), 1)
+            difficulty = 1.0 / math.sqrt(domain_size)
+            score = (
+                q_weight * q
+                + dist_weight * soft
+                + local_weight * local
+                + difficulty_weight * difficulty
+            )
+            scored.append((cid, score))
+
+        selected = []
+        available = scored
+        while available and len(selected) < destroy_size:
+            max_score = max(score for _cid, score in available)
+            weights = [math.exp((score - max_score) / temperature) for _cid, score in available]
+            pos = random.choices(range(len(available)), weights=weights, k=1)[0]
+            cid, _score = available.pop(pos)
+            selected.append(cid)
+
+        return selected
+
+    def _update_marl_policy(self, removed: Set[str], reward: float):
+        if not removed:
+            return
+        alpha = float(self.cfg.get("marl_alpha", 0.20))
+        reward = max(-1.0, min(1.0, float(reward)))
+        for cid in removed:
+            old_q = self._marl_q[cid]
+            self._marl_q[cid] = old_q + alpha * (reward - old_q)
+            self._marl_count[cid] += 1
 
     def _repair(self, base_x: torch.Tensor, removed: Set[str]) -> Tuple[torch.Tensor, bool]:
         if self.cfg.get("repair_method", "beam") == "beam":
@@ -293,7 +375,7 @@ class LargeNeighborhoodSearch:
                 return x_candidate, True
         return beam[0][0], False
 
-    def step(self, x_current: torch.Tensor, destroy_size: int) -> Tuple[torch.Tensor, bool]:
+    def step(self, x_current: torch.Tensor, destroy_size: int) -> Tuple[torch.Tensor, bool, Set[str]]:
         class_to_xidx = self._class_map(x_current)
         removed = set(self._destroy_classes(x_current, class_to_xidx, destroy_size))
 
@@ -302,7 +384,8 @@ class LargeNeighborhoodSearch:
             old_idx = class_to_xidx[cid]
             base_x[old_idx] = 0.0
 
-        return self._repair(base_x, removed)
+        candidate_x, repaired = self._repair(base_x, removed)
+        return candidate_x, repaired, removed
 
     def search(self, x_init: torch.Tensor):
         seed = self.cfg.get("seed", None)
@@ -326,14 +409,19 @@ class LargeNeighborhoodSearch:
         feasible_repairs = 0
 
         for iteration in range(1, max_iter + 1):
-            candidate_x, repaired = self.step(x_current, destroy_size)
+            candidate_x, repaired, removed = self.step(x_current, destroy_size)
             if not repaired or not self.ev.is_feasible(candidate_x):
+                if self.cfg.get("destroy_strategy", "random") in {"marl", "marl_guided"}:
+                    self._update_marl_policy(removed, -float(self.cfg.get("marl_failed_reward", 0.02)))
                 temperature *= cooling
                 continue
 
             feasible_repairs += 1
             candidate_cost = self.ev.evaluate(candidate_x)
             delta = candidate_cost["total"] - current_cost["total"]
+            if self.cfg.get("destroy_strategy", "random") in {"marl", "marl_guided"}:
+                reward_scale = max(abs(float(current_cost["total"])), 1.0)
+                self._update_marl_policy(removed, -float(delta) / reward_scale)
             accept = delta < 0.0
             if not accept and acceptance == "sa":
                 accept = random.random() < math.exp(-delta / max(temperature, 1e-9))
@@ -359,7 +447,13 @@ class LargeNeighborhoodSearch:
             "accepted": accepted,
             "feasible_repairs": feasible_repairs,
             "destroy_stats": dict(self.destroy_stats),
+            "marl_top_q": self._top_marl_q(),
         }
+
+    def _top_marl_q(self, limit: int = 10):
+        items = [(cid, q, self._marl_count[cid]) for cid, q in self._marl_q.items() if self._marl_count[cid] > 0]
+        items.sort(key=lambda item: item[1], reverse=True)
+        return items[:limit]
 
 
 def run_lns(
@@ -408,6 +502,9 @@ def run_lns(
     print(f"Repairs    : {result.get('feasible_repairs', 0)}")
     if result.get("destroy_stats"):
         print(f"Destroy    : {result['destroy_stats']}")
+    if result.get("marl_top_q"):
+        formatted = ", ".join(f"{cid}:{q:.3f}/{count}" for cid, q, count in result["marl_top_q"])
+        print(f"MARL top Q : {formatted}")
     print(f"Feasible   : {feasible}")
     if not feasible:
         viol = evaluator.check_violations(result_x)
