@@ -39,6 +39,50 @@ def build_model(instance: str, data_dir: pathlib.Path, device: str, matrix: bool
     return reader, constraints
 
 
+def _repair_invalid_with_anchor(x, anchor_x, constraints, loader, evaluator, max_classes: int = None):
+    """Try to make a hard-invalid pool member feasible by reverting hot classes to anchor."""
+    scores = evaluator.local_validator.hard_violation_class_scores_from_x(x, constraints)
+    if not scores:
+        return None, None, 0
+
+    current = loader._class_assignment_from_x(x, constraints)
+    fallback = loader._class_assignment_from_x(anchor_x, constraints)
+    scored_order = sorted(scores, key=lambda cid: (-scores[cid], int(cid) if str(cid).isdigit() else str(cid)))
+    remaining = [
+        cid for cid in constraints.reader.classes
+        if cid not in scores and current.get(cid) != fallback.get(cid)
+    ]
+    remaining.sort(key=lambda cid: int(cid) if str(cid).isdigit() else str(cid))
+    ordered = scored_order + remaining
+    if max_classes is not None:
+        ordered = ordered[:max_classes]
+    checkpoints = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, len(ordered)}
+
+    candidate = x.clone()
+    changed = 0
+    for cid in ordered:
+        old_idx = current.get(cid)
+        new_idx = fallback.get(cid)
+        if new_idx is None or old_idx == new_idx:
+            continue
+        if old_idx is not None:
+            candidate[old_idx] = 0.0
+        candidate[new_idx] = 1.0
+        current[cid] = new_idx
+        changed += 1
+
+        if changed in checkpoints:
+            cost = evaluator.evaluate(candidate)
+            if cost.get("valid", True):
+                return candidate, cost, changed
+
+    if changed:
+        cost = evaluator.evaluate(candidate)
+        if cost.get("valid", True):
+            return candidate, cost, changed
+    return None, None, changed
+
+
 def evaluate_solution_pool(solutions_dir: pathlib.Path, instance: str,
                            constraints, loader, evaluator):
     """Load existing solution XMLs, compute cost stats, return list of (path, x_tensor)."""
@@ -53,6 +97,7 @@ def evaluate_solution_pool(solutions_dir: pathlib.Path, instance: str,
 
     pool = []
     costs = []
+    skipped = []
     for path, sol_dict in all_solutions:
         try:
             x = loader.encode(sol_dict, constraints)
@@ -60,7 +105,74 @@ def evaluate_solution_pool(solutions_dir: pathlib.Path, instance: str,
             pool.append((path, x))
             costs.append(c)
         except Exception as e:
-            print(f"  Skipping {pathlib.Path(path).name}: {e}")
+            skipped.append((path, sol_dict, e))
+            print(f"  Strict skip {pathlib.Path(path).name}: {e}")
+
+    repaired = 0
+    repaired_valid = 0
+    repair_log_limit = 20
+    if skipped and pool:
+        valid_indices = [i for i, c in enumerate(costs) if c.get("valid", True)]
+        anchor_candidates = valid_indices or list(range(len(costs)))
+        anchor_idx = min(anchor_candidates, key=lambda i: costs[i]["total"])
+        anchor_path, anchor_x = pool[anchor_idx]
+        print(
+            f"Repairing {len(skipped)} skipped solution XMLs with anchor "
+            f"{pathlib.Path(anchor_path).name}"
+        )
+
+        for path, sol_dict, _err in skipped:
+            try:
+                x, stats = loader.encode_with_fallback(sol_dict, constraints, anchor_x)
+                c = evaluator.evaluate(x)
+                pool.append((path, x))
+                costs.append(c)
+                repaired += 1
+                if c.get("valid", True):
+                    repaired_valid += 1
+                if repaired <= repair_log_limit:
+                    print(
+                        f"  Repaired {pathlib.Path(path).name}: "
+                        f"matched={stats['matched']} fallback={stats['fallback']} "
+                        f"valid={c.get('valid', True)} total={c['total']:.1f}"
+                    )
+            except Exception as e:
+                print(f"  Repair failed {pathlib.Path(path).name}: {e}")
+
+    if repaired:
+        if repaired > repair_log_limit:
+            print(f"  ... {repaired - repair_log_limit} more fallback repairs omitted")
+        print(f"Repaired pool additions: {repaired_valid}/{repaired} feasible")
+
+    invalid_indices = [i for i, c in enumerate(costs) if not c.get("valid", True)]
+    invalid_repaired = 0
+    invalid_repair_log_limit = 20
+    if invalid_indices:
+        valid_indices = [i for i, c in enumerate(costs) if c.get("valid", True)]
+        if valid_indices:
+            anchor_idx = min(valid_indices, key=lambda i: costs[i]["total"])
+            anchor_path, anchor_x = pool[anchor_idx]
+            print(
+                f"Repairing {len(invalid_indices)} hard-invalid pool members with anchor "
+                f"{pathlib.Path(anchor_path).name}"
+            )
+            for i in invalid_indices:
+                path, x = pool[i]
+                repaired_x, repaired_cost, changed = _repair_invalid_with_anchor(
+                    x, anchor_x, constraints, loader, evaluator
+                )
+                if repaired_cost is not None:
+                    pool[i] = (path, repaired_x)
+                    costs[i] = repaired_cost
+                    invalid_repaired += 1
+                    if invalid_repaired <= invalid_repair_log_limit:
+                        print(
+                            f"  Feasibility-repaired {pathlib.Path(path).name}: "
+                            f"changed={changed} total={repaired_cost['total']:.1f}"
+                        )
+            if invalid_repaired > invalid_repair_log_limit:
+                print(f"  ... {invalid_repaired - invalid_repair_log_limit} more feasibility repairs omitted")
+            print(f"Feasibility-repaired pool members: {invalid_repaired}/{len(invalid_indices)}")
 
     if not costs:
         raise ValueError(f"No solution XMLs could be loaded for {instance}")

@@ -124,6 +124,41 @@ class LocalValidator:
 
         return scores
 
+    def hard_violation_class_scores_from_x(self, x_tensor: torch.Tensor, constraints) -> Dict[str, float]:
+        """
+        Return cid -> score for classes involved in hard violations.
+
+        This is used as a repair guide for imported pool solutions that are
+        close to feasible but violate room or hard distribution constraints.
+        Scores are heuristic counts; final feasibility is still decided only by
+        validate_x_tensor().
+        """
+        solution = {}
+        for xidx in torch.where(x_tensor > 0.5)[0].tolist():
+            cid, tidx, rid = constraints.xidx_to_x[xidx]
+            topt = self._time_option_by_index(cid, tidx)
+            weeks, days, start, _length = topt["optional_time_bits"]
+            solution[cid] = {
+                "weeks": weeks,
+                "days": days,
+                "start": start,
+                "room": rid if rid != "dummy" else None,
+            }
+
+        assignments, validation_errors = self._build_assignments(solution)
+        scores = self._room_violation_scores(assignments)
+
+        for constraint in self.reader.distributions.get("hard_constraints", []):
+            for cid, score in self._hard_constraint_violation_scores(constraint, assignments).items():
+                scores[cid] = scores.get(cid, 0.0) + score
+
+        for error in validation_errors:
+            parts = error.split()
+            if len(parts) >= 2 and parts[0] == "class":
+                scores[parts[1]] = scores.get(parts[1], 0.0) + 1.0
+
+        return scores
+
     def validate_solution(self, solution: Dict[str, dict]) -> dict:
         assignments, validation_errors = self._build_assignments(solution)
 
@@ -258,6 +293,27 @@ class LocalValidator:
                     violations += 1
         return violations
 
+    def _room_violation_scores(self, assignments: Dict[str, Assignment]) -> Dict[str, float]:
+        scores: Dict[str, float] = {}
+        by_room: Dict[str, List[Assignment]] = {}
+        for assignment in assignments.values():
+            if assignment.room is None:
+                continue
+            by_room.setdefault(assignment.room, []).append(assignment)
+            for unavailable in self.reader.rooms.get(assignment.room, {}).get("unavailables_bits", []):
+                if self._time_overlap_bits(
+                    (assignment.weeks, assignment.days, assignment.start, assignment.length),
+                    unavailable,
+                ):
+                    scores[assignment.cid] = scores.get(assignment.cid, 0.0) + 1.0
+
+        for room_assignments in by_room.values():
+            for a, b in itertools.combinations(room_assignments, 2):
+                if self._overlap(a, b):
+                    scores[a.cid] = scores.get(a.cid, 0.0) + 1.0
+                    scores[b.cid] = scores.get(b.cid, 0.0) + 1.0
+        return scores
+
     # ------------------------------------------------------------------
     # Distribution constraints
     # ------------------------------------------------------------------
@@ -348,6 +404,29 @@ class LocalValidator:
             return scores
 
         count = self._constraint_violation_count(constraint, assignments, hard=False)
+        if count <= 0:
+            return scores
+        for cid in cids:
+            scores[cid] = scores.get(cid, 0.0) + float(count)
+        return scores
+
+    def _hard_constraint_violation_scores(self, constraint: dict, assignments: Dict[str, Assignment]) -> Dict[str, float]:
+        ctype, params = self._parse_type(constraint["type"])
+        cids = [cid for cid in constraint["classes"] if cid in assignments]
+        scores: Dict[str, float] = {}
+
+        if len(cids) < 2 and ctype in self.PAIRWISE_TYPES:
+            return scores
+
+        if ctype in self.PAIRWISE_TYPES:
+            ordered_pairs = self._ordered_pairs(cids) if ctype == "Precedence" else itertools.combinations(cids, 2)
+            for cid_a, cid_b in ordered_pairs:
+                if self._pair_violates(ctype, params, assignments[cid_a], assignments[cid_b]):
+                    scores[cid_a] = scores.get(cid_a, 0.0) + 1.0
+                    scores[cid_b] = scores.get(cid_b, 0.0) + 1.0
+            return scores
+
+        count = self._constraint_violation_count(constraint, assignments, hard=True)
         if count <= 0:
             return scores
         for cid in cids:

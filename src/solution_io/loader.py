@@ -1,7 +1,7 @@
 import xml.etree.ElementTree as ET
 import torch
 import pathlib
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 class SolutionLoader:
@@ -105,6 +105,55 @@ class SolutionLoader:
             )
         return x
 
+    def encode_with_fallback(
+        self,
+        solution: Dict,
+        constraints,
+        fallback_x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, int]]:
+        """
+        Encode a possibly partial/invalid solution by filling unmatched classes
+        from a known complete incumbent.
+
+        This is intentionally conservative: we only trust exact solution
+        assignments that map to an existing x variable. Missing, blank, invalid,
+        or room-filtered assignments are copied class-by-class from fallback_x.
+        The caller should still run the local validator and keep only feasible
+        candidates for best-solution decisions.
+        """
+        fallback = self._class_assignment_from_x(fallback_x, constraints)
+        x = torch.zeros_like(constraints.x_tensor)
+        stats = {
+            "matched": 0,
+            "fallback": 0,
+            "missing": 0,
+            "invalid_time": 0,
+            "invalid_room": 0,
+            "filtered_room_time": 0,
+            "unmatched": 0,
+        }
+
+        for cid in constraints.reader.classes:
+            xidx, reason = self._match_assignment_xidx(cid, solution.get(cid), constraints)
+            if xidx is not None:
+                x[xidx] = 1.0
+                stats["matched"] += 1
+                continue
+
+            if reason in stats:
+                stats[reason] += 1
+            else:
+                stats["unmatched"] += 1
+
+            fallback_idx = fallback.get(cid)
+            if fallback_idx is not None:
+                x[fallback_idx] = 1.0
+                stats["fallback"] += 1
+            else:
+                stats["unmatched"] += 1
+
+        return x, stats
+
     def _match_time_option(self, cid: str, days_str: str, start: int,
                            weeks_str: str, constraints) -> Optional[int]:
         """Return tidx of the matching time option, or None if not found."""
@@ -113,6 +162,36 @@ class SolutionLoader:
             if d == days_str and s == start and w == weeks_str:
                 return tidx
         return None
+
+    def _match_assignment_xidx(self, cid: str, assignment: Optional[Dict], constraints):
+        """Return (xidx, reason). reason is set when xidx is None."""
+        if assignment is None:
+            return None, "missing"
+
+        days_str = assignment.get("days", "")
+        weeks_str = assignment.get("weeks", "")
+        start = assignment.get("start", 0)
+        room_str = assignment.get("room")
+
+        tidx = self._match_time_option(cid, days_str, start, weeks_str, constraints)
+        if tidx is None:
+            return None, "invalid_time"
+
+        rid = room_str if room_str is not None else "dummy"
+        if rid not in constraints.class_to_room_options.get(cid, []):
+            return None, "invalid_room"
+
+        key = (cid, tidx, rid)
+        if key not in constraints.x:
+            return None, "filtered_room_time"
+        return constraints.x[key], None
+
+    def _class_assignment_from_x(self, x_tensor: torch.Tensor, constraints) -> Dict[str, int]:
+        result = {}
+        for xidx in torch.where(x_tensor > 0.5)[0].tolist():
+            cid, _tidx, _rid = constraints.xidx_to_x[int(xidx)]
+            result[cid] = int(xidx)
+        return result
 
     # ------------------------------------------------------------------
     # Decode: x_tensor → solution dict
