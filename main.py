@@ -8,12 +8,21 @@ Usage:
 """
 
 import argparse
+import csv
+import gc
 import pathlib
 import time
 import torch
 import yaml
 
 folder = pathlib.Path(__file__).parent.resolve()
+
+
+def resolve_path(path_value: str) -> pathlib.Path:
+    path = pathlib.Path(path_value)
+    if not path.is_absolute():
+        path = folder / path
+    return path
 
 
 def build_model(instance: str, data_dir: pathlib.Path, device: str, matrix: bool = False):
@@ -191,110 +200,214 @@ def evaluate_solution_pool(solutions_dir: pathlib.Path, instance: str,
     return pool, costs
 
 
+def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir: pathlib.Path,
+                 output_dir: pathlib.Path) -> dict:
+    method = cfg.get("method", "merging")
+    device = cfg.get("device", "cpu")
+
+    print(f"\n{'#' * 72}")
+    print(f"Instance : {instance}")
+    print(f"Method   : {method}")
+
+    t0 = time.time()
+    result_xml = None
+    try:
+        # -----------------------------------------------------------------------
+        # Build constraint model (shared by all methods)
+        # -----------------------------------------------------------------------
+        reader, constraints = build_model(instance, data_dir, device, matrix=bool(cfg.get("matrix", False)))
+
+        from src.solution_io import SolutionLoader, SolutionEvaluator
+        loader = SolutionLoader()
+        evaluator = SolutionEvaluator(constraints)
+
+        # Evaluate existing solution pool.
+        pool, pool_costs = evaluate_solution_pool(solutions_dir, instance, constraints, loader, evaluator)
+
+        # -----------------------------------------------------------------------
+        # Dispatch to method
+        # -----------------------------------------------------------------------
+        if method == "merging":
+            from src.merging import run_merging
+            result_x, result_cost, result_xml = run_merging(
+                cfg.get("merging", {}),
+                constraints, loader, evaluator,
+                pool, pool_costs, instance, output_dir
+            )
+
+        elif method == "local_search":
+            from src.local_search import run_local_search
+            result_x, result_cost, result_xml = run_local_search(
+                cfg.get("local_search", {}),
+                constraints, loader, evaluator,
+                pool, pool_costs, instance, output_dir
+            )
+
+        elif method == "lns":
+            from src.lns import run_lns
+            result_x, result_cost, result_xml = run_lns(
+                cfg.get("lns", {}),
+                constraints, loader, evaluator,
+                pool, pool_costs, instance, output_dir
+            )
+
+        elif method == "tensor_search":
+            from src.tensor_search import run_tensor_search
+            result_x, result_cost, result_xml = run_tensor_search(
+                cfg.get("tensor_search", {}),
+                constraints, loader, evaluator,
+                pool, pool_costs, instance, output_dir
+            )
+
+        else:
+            raise ValueError(f"Unknown method: {method}. Choices: merging, local_search, lns, tensor_search")
+
+        # -----------------------------------------------------------------------
+        # Summary
+        # -----------------------------------------------------------------------
+        valid_pool_costs = [c for c in pool_costs if c.get("valid", True)]
+        baseline_costs = valid_pool_costs or pool_costs
+        pool_best = min(c["total"] for c in baseline_costs)
+        improve = (pool_best - result_cost["total"]) / pool_best * 100 if pool_best > 0 else 0.0
+        print(f"\n{'='*60}")
+        print(f"Final result ({method}):")
+        print(f"  Total cost   : {result_cost['total']:.1f}  (pool best: {pool_best:.1f},  Δ = {improve:+.2f}%)")
+        print(f"  Time penalty : {result_cost['time']:.1f}")
+        print(f"  Room penalty : {result_cost['room']:.1f}")
+        print(f"  Distribution : {result_cost['distribution']:.1f}")
+
+        # Optional: validate with official API
+        validate = cfg.get(method, {}).get("validate", False)
+        if validate and result_xml:
+            print(f"\nValidating {pathlib.Path(result_xml).name} against official validator ...")
+            try:
+                from src.solution_io import report_result
+                official = report_result(result_xml)
+                if official:
+                    print(f"Official total cost: {official['Total cost']}")
+            except Exception as e:
+                print(f"Validator unavailable: {e}")
+
+        return {
+            "instance": instance,
+            "status": "ok",
+            "method": method,
+            "pool_best": float(pool_best),
+            "total": float(result_cost["total"]),
+            "improvement_pct": float(improve),
+            "time": float(result_cost["time"]),
+            "room": float(result_cost["room"]),
+            "distribution": float(result_cost["distribution"]),
+            "valid": bool(result_cost.get("valid", True)),
+            "runtime_sec": round(time.time() - t0, 2),
+            "output_xml": str(result_xml or ""),
+            "error": "",
+        }
+    except Exception as e:
+        print(f"\nInstance failed: {instance}: {e}")
+        return {
+            "instance": instance,
+            "status": "failed",
+            "method": method,
+            "pool_best": "",
+            "total": "",
+            "improvement_pct": "",
+            "time": "",
+            "room": "",
+            "distribution": "",
+            "valid": False,
+            "runtime_sec": round(time.time() - t0, 2),
+            "output_xml": "",
+            "error": str(e),
+        }
+    finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def write_batch_summary(rows: list, output_dir: pathlib.Path, method: str) -> pathlib.Path:
+    out_path = output_dir / f"batch_{method}_summary.csv"
+    if not rows:
+        return out_path
+    fields = [
+        "instance", "status", "method", "pool_best", "total", "improvement_pct",
+        "time", "room", "distribution", "valid", "runtime_sec", "output_xml", "error",
+    ]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return out_path
+
+
+def print_batch_summary(rows: list):
+    print(f"\n{'=' * 72}")
+    print("Batch summary")
+    ok_rows = [r for r in rows if r["status"] == "ok"]
+    failed_rows = [r for r in rows if r["status"] != "ok"]
+    improved_rows = [
+        r for r in ok_rows
+        if isinstance(r.get("improvement_pct"), float) and r["improvement_pct"] > 0
+    ]
+    print(f"Instances : {len(rows)}")
+    print(f"OK        : {len(ok_rows)}")
+    print(f"Failed    : {len(failed_rows)}")
+    print(f"Improved  : {len(improved_rows)}")
+    for r in rows:
+        if r["status"] == "ok":
+            print(
+                f"  {r['instance']}: total={r['total']:.1f} "
+                f"pool={r['pool_best']:.1f} improve={r['improvement_pct']:+.2f}% "
+                f"valid={r['valid']}"
+            )
+        else:
+            print(f"  {r['instance']}: FAILED - {r['error']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="ITC2019 post-optimization")
     parser.add_argument("--config",   default="config.yaml", help="config file path")
     parser.add_argument("--instance", default=None, help="override instance name")
+    parser.add_argument("--data_folder", default=None, help="run every *.xml instance in this problem-data folder")
     parser.add_argument("--method",   default=None, help="override method")
     parser.add_argument("--device",   default=None, help="override device")
     args = parser.parse_args()
 
-    config_path = folder / args.config
+    config_path = resolve_path(args.config)
     with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     if args.instance: cfg["instance"] = args.instance
     if args.method:   cfg["method"]   = args.method
     if args.device:   cfg["device"]   = args.device
+    if args.data_folder:
+        cfg["data_dir"] = args.data_folder
 
-    instance     = cfg["instance"]
     method       = cfg.get("method", "merging")
-    device       = cfg.get("device", "cpu")
-    data_dir     = folder / cfg.get("data_dir",     "data/reduced")
-    solutions_dir = folder / cfg.get("solutions_dir", "data/solutions")
-    output_dir   = folder / cfg.get("output_dir",   "output")
+    data_dir     = resolve_path(cfg.get("data_dir", "data/reduced"))
+    solutions_dir = resolve_path(cfg.get("solutions_dir", "data/solutions"))
+    output_dir   = resolve_path(cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Instance : {instance}")
-    print(f"Method   : {method}")
+    if args.data_folder:
+        instance_paths = sorted(data_dir.glob("*.xml"))
+        if not instance_paths:
+            raise FileNotFoundError(f"No problem XML files found in data_folder: {data_dir}")
+        print(f"Batch mode: {len(instance_paths)} instances from {data_dir}")
+        print(f"Method    : {method}")
+        print(f"Device    : {cfg.get('device', 'cpu')}")
+        rows = [
+            run_instance(cfg, path.stem, data_dir, solutions_dir, output_dir)
+            for path in instance_paths
+        ]
+        summary_path = write_batch_summary(rows, output_dir, method)
+        print_batch_summary(rows)
+        print(f"Summary CSV: {summary_path}")
+        return
 
-    # -----------------------------------------------------------------------
-    # Build constraint model (shared by all methods)
-    # -----------------------------------------------------------------------
-    reader, constraints = build_model(instance, data_dir, device, matrix=bool(cfg.get("matrix", False)))
-
-    from src.solution_io import SolutionLoader, SolutionEvaluator
-    loader    = SolutionLoader()
-    evaluator = SolutionEvaluator(constraints)
-
-    # Evaluate existing solution pool.
-    pool, pool_costs = evaluate_solution_pool(solutions_dir, instance, constraints,
-                                              loader, evaluator)
-
-    # -----------------------------------------------------------------------
-    # Dispatch to method
-    # -----------------------------------------------------------------------
-    result_xml = None
-    if method == "merging":
-        from src.merging import run_merging
-        result_x, result_cost, result_xml = run_merging(
-            cfg.get("merging", {}),
-            constraints, loader, evaluator,
-            pool, pool_costs, instance, output_dir
-        )
-
-    elif method == "local_search":
-        from src.local_search import run_local_search
-        result_x, result_cost, result_xml = run_local_search(
-            cfg.get("local_search", {}),
-            constraints, loader, evaluator,
-            pool, pool_costs, instance, output_dir
-        )
-
-    elif method == "lns":
-        from src.lns import run_lns
-        result_x, result_cost, result_xml = run_lns(
-            cfg.get("lns", {}),
-            constraints, loader, evaluator,
-            pool, pool_costs, instance, output_dir
-        )
-
-    elif method == "tensor_search":
-        from src.tensor_search import run_tensor_search
-        result_x, result_cost, result_xml = run_tensor_search(
-            cfg.get("tensor_search", {}),
-            constraints, loader, evaluator,
-            pool, pool_costs, instance, output_dir
-        )
-
-    else:
-        raise ValueError(f"Unknown method: {method}. Choices: merging, local_search, lns, tensor_search")
-
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
-    valid_pool_costs = [c for c in pool_costs if c.get("valid", True)]
-    baseline_costs = valid_pool_costs or pool_costs
-    pool_best = min(c["total"] for c in baseline_costs)
-    improve  = (pool_best - result_cost["total"]) / pool_best * 100 if pool_best > 0 else 0.0
-    print(f"\n{'='*60}")
-    print(f"Final result ({method}):")
-    print(f"  Total cost   : {result_cost['total']:.1f}  (pool best: {pool_best:.1f},  Δ = {improve:+.2f}%)")
-    print(f"  Time penalty : {result_cost['time']:.1f}")
-    print(f"  Room penalty : {result_cost['room']:.1f}")
-    print(f"  Distribution : {result_cost['distribution']:.1f}")
-
-    # Optional: validate with official API
-    validate = cfg.get(method, {}).get("validate", False)
-    if validate and result_xml:
-        print(f"\nValidating {pathlib.Path(result_xml).name} against official validator …")
-        try:
-            from src.solution_io import report_result
-            official = report_result(result_xml)
-            if official:
-                print(f"Official total cost: {official['Total cost']}")
-        except Exception as e:
-            print(f"Validator unavailable: {e}")
+    instance = cfg["instance"]
+    run_instance(cfg, instance, data_dir, solutions_dir, output_dir)
 
 
 if __name__ == "__main__":
