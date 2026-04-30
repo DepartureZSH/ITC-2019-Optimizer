@@ -78,3 +78,17 @@ tensor_search:
   gradient_options_per_class: 1
   seed: 42
   validate: false
+
+student_assignment:
+  enabled: false
+  method: marl_guided
+  iterations: 2
+  max_bundles_per_course: 250
+  candidate_limit: 40
+  alpha: 0.25
+  epsilon: 0.1
+  temperature: 1.0
+  q_weight: 1.0
+  conflict_weight: 1.0
+  capacity_weight: 4.0
+  worse_reward: 0.02

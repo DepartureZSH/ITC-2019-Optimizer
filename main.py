@@ -262,6 +262,17 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
         else:
             raise ValueError(f"Unknown method: {method}. Choices: merging, local_search, lns, tensor_search")
 
+        student_stats = None
+        student_xml = ""
+        student_cfg = cfg.get("student_assignment", {})
+        if student_cfg.get("enabled", False):
+            from src.student_assignment import run_student_assignment
+            base_solution = loader.decode(result_x, constraints)
+            _student_solution, student_stats, student_xml = run_student_assignment(
+                student_cfg, reader, loader, base_solution, instance, output_dir
+            )
+            result_xml = student_xml
+
         # -----------------------------------------------------------------------
         # Summary
         # -----------------------------------------------------------------------
@@ -275,6 +286,10 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
         print(f"  Time penalty : {result_cost['time']:.1f}")
         print(f"  Room penalty : {result_cost['room']:.1f}")
         print(f"  Distribution : {result_cost['distribution']:.1f}")
+        if student_stats:
+            student_weight = int((reader.optimization or {}).get("student", 0))
+            weighted_student = student_stats["student_conflicts"] * student_weight
+            print(f"  Student conflicts: {student_stats['student_conflicts']}  weighted={weighted_student}")
 
         # Optional: validate with official API
         validate = cfg.get(method, {}).get("validate", False)
@@ -301,6 +316,9 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
             "valid": bool(result_cost.get("valid", True)),
             "runtime_sec": round(time.time() - t0, 2),
             "output_xml": str(result_xml or ""),
+            "student_conflicts": "" if not student_stats else int(student_stats["student_conflicts"]),
+            "weighted_student": "" if not student_stats else int(student_stats["student_conflicts"]) * int((reader.optimization or {}).get("student", 0)),
+            "student_xml": str(student_xml or ""),
             "error": "",
         }
     except Exception as e:
@@ -318,6 +336,9 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
             "valid": False,
             "runtime_sec": round(time.time() - t0, 2),
             "output_xml": "",
+            "student_conflicts": "",
+            "weighted_student": "",
+            "student_xml": "",
             "error": str(e),
         }
     finally:
@@ -332,7 +353,8 @@ def write_batch_summary(rows: list, output_dir: pathlib.Path, method: str) -> pa
         return out_path
     fields = [
         "instance", "status", "method", "pool_best", "total", "improvement_pct",
-        "time", "room", "distribution", "valid", "runtime_sec", "output_xml", "error",
+        "time", "room", "distribution", "valid", "runtime_sec", "output_xml",
+        "student_conflicts", "weighted_student", "student_xml", "error",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -372,6 +394,7 @@ def main():
     parser.add_argument("--data_folder", default=None, help="run every *.xml instance in this problem-data folder")
     parser.add_argument("--method",   default=None, help="override method")
     parser.add_argument("--device",   default=None, help="override device")
+    parser.add_argument("--student_assignment", action="store_true", help="enable final MARL-guided student assignment")
     args = parser.parse_args()
 
     config_path = resolve_path(args.config)
@@ -383,6 +406,8 @@ def main():
     if args.device:   cfg["device"]   = args.device
     if args.data_folder:
         cfg["data_dir"] = args.data_folder
+    if args.student_assignment:
+        cfg.setdefault("student_assignment", {})["enabled"] = True
 
     method       = cfg.get("method", "merging")
     data_dir     = resolve_path(cfg.get("data_dir", "data/reduced"))

@@ -44,6 +44,7 @@ class SolutionLoader:
                 "start": int(cls.attrib.get("start", 0)),
                 "weeks": cls.attrib.get("weeks", ""),
                 "room":  cls.attrib.get("room"),   # None if absent
+                "students": [s.attrib["id"] for s in cls.findall("student") if "id" in s.attrib],
             }
         return solution
 
@@ -256,6 +257,9 @@ class SolutionLoader:
             elem.set("weeks", asgn["weeks"])
             if asgn["room"] is not None:
                 elem.set("room", asgn["room"])
+            for sid in sorted(asgn.get("students", []), key=lambda x: int(x) if str(x).isdigit() else str(x)):
+                student = ET.SubElement(elem, "student")
+                student.set("id", str(sid))
 
         tree = ET.ElementTree(root)
         ET.indent(tree, space="\t")
