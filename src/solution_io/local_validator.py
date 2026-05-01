@@ -23,11 +23,11 @@ class Assignment:
 
 class LocalValidator:
     """
-    Local ITC2019 validator for the no-student-assignment project variant.
+    Local ITC2019 validator for the project variant.
 
-    It follows the official XML scoring definitions for time, room, and
-    distribution penalties. Student conflicts are intentionally reported as 0
-    because this project version writes no <student> elements in solutions.
+    It follows the official XML scoring definitions for time, room,
+    distribution, and optional student conflicts. Solution XMLs without
+    <student> children naturally report student conflicts as 0.
     """
 
     PAIRWISE_TYPES = {
@@ -169,7 +169,7 @@ class LocalValidator:
         hard_dist_violations, soft_distribution_raw, soft_details = self._distribution_penalties(assignments)
 
         hard_violations = room_violations + hard_dist_violations + len(validation_errors)
-        student_conflicts = 0
+        student_conflicts = self._student_conflicts(solution, assignments)
 
         weighted_time = time_raw * self.weights["time"]
         weighted_room = room_raw * self.weights["room"]
@@ -200,6 +200,22 @@ class LocalValidator:
             "validation_errors": validation_errors,
             "soft_details": soft_details,
         }
+
+    def _student_conflicts(self, solution: Dict[str, dict], assignments: Dict[str, Assignment]) -> int:
+        by_student: Dict[str, List[str]] = {}
+        for cid, sol in solution.items():
+            if cid not in assignments:
+                continue
+            for sid in sol.get("students", []):
+                by_student.setdefault(str(sid), []).append(cid)
+
+        conflicts = 0
+        for cids in by_student.values():
+            unique_cids = sorted(set(cids), key=self._sort_key)
+            for cid_a, cid_b in itertools.combinations(unique_cids, 2):
+                if not self._same_attendees_ok(assignments[cid_a], assignments[cid_b]):
+                    conflicts += 1
+        return conflicts
 
     # ------------------------------------------------------------------
     # Assignment parsing

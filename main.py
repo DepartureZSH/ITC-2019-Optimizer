@@ -5,6 +5,7 @@ Usage:
     python main.py --config my_config.yaml
     python main.py --instance muni-fi-fal17
     python main.py --method local_search
+    python main.py --student_assignment          # add students to an existing solution XML
 """
 
 import argparse
@@ -46,6 +47,157 @@ def build_model(instance: str, data_dir: pathlib.Path, device: str, matrix: bool
     constraints.build_model()
     print(f"Model built in {time.time()-t0:.1f}s")
     return reader, constraints
+
+
+def load_problem_reader(instance: str, data_dir: pathlib.Path, matrix: bool = False):
+    from src.utils.dataReader import PSTTReader
+
+    problem_path = data_dir / f"{instance}.xml"
+    if not problem_path.exists():
+        raise FileNotFoundError(f"Problem XML not found: {problem_path}")
+
+    print(f"\n{'='*60}")
+    print(f"Loading problem XML only: {instance}")
+    print("Skipping class-assignment constraint model build")
+    t0 = time.time()
+    reader = PSTTReader(str(problem_path), matrix=matrix)
+    print(f"Problem loaded in {time.time()-t0:.1f}s")
+    return reader
+
+
+def _load_student_assignment_source(cfg: dict, instance: str, solutions_dir: pathlib.Path, loader, reader):
+    from src.solution_io import LocalValidator
+
+    student_cfg = cfg.get("student_assignment", {})
+    source_xml = student_cfg.get("source_xml")
+    if source_xml:
+        source_path = resolve_path(source_xml)
+        solution = loader.load_xml(str(source_path))
+        cost = LocalValidator(reader).validate_solution(solution)
+        return str(source_path), solution, cost, 1
+
+    all_solutions = loader.load_all(str(solutions_dir), instance)
+    if not all_solutions:
+        raise FileNotFoundError(f"No solution XMLs found for {instance} under {solutions_dir / instance}")
+
+    source = student_cfg.get("source", "best_local")
+    if source == "first":
+        path, solution = all_solutions[0]
+        cost = LocalValidator(reader).validate_solution(solution)
+        return path, solution, cost, len(all_solutions)
+
+    validator = LocalValidator(reader)
+    scored = []
+    skipped = []
+    for path, solution in all_solutions:
+        try:
+            cost = validator.validate_solution(solution)
+            scored.append((path, solution, cost))
+        except Exception as exc:
+            skipped.append((path, exc))
+            print(f"  Skip {pathlib.Path(path).name}: {exc}")
+
+    if not scored:
+        raise ValueError(f"No solution XMLs could be read for {instance}")
+
+    valid_scored = [item for item in scored if item[2].get("valid", True)]
+    candidates = valid_scored or scored
+    best = min(candidates, key=lambda item: item[2]["total"])
+    if skipped:
+        print(f"Skipped unreadable solutions: {len(skipped)}")
+    print(
+        f"Loaded {len(scored)} solution XMLs; "
+        f"valid={len(valid_scored)}/{len(scored)}; "
+        f"selected={pathlib.Path(best[0]).name}"
+    )
+    return best[0], best[1], best[2], len(scored)
+
+
+def run_student_assignment_instance(cfg: dict, instance: str, data_dir: pathlib.Path,
+                                    solutions_dir: pathlib.Path, output_dir: pathlib.Path) -> dict:
+    method = "student_assignment"
+    t0 = time.time()
+    result_xml = ""
+    try:
+        reader = load_problem_reader(instance, data_dir, matrix=bool(cfg.get("matrix", False)))
+
+        from src.solution_io import LocalValidator, SolutionLoader, report_result
+        from src.student_assignment import run_student_assignment
+
+        loader = SolutionLoader()
+        source_path, base_solution, base_cost, pool_size = _load_student_assignment_source(
+            cfg, instance, solutions_dir, loader, reader
+        )
+
+        student_cfg = dict(cfg.get("student_assignment", {}))
+        student_cfg["enabled"] = True
+        _solution, student_stats, result_xml = run_student_assignment(
+            student_cfg, reader, loader, base_solution, instance, output_dir
+        )
+        final_cost = LocalValidator(reader).validate_xml(result_xml, loader)
+
+        student_weight = int((reader.optimization or {}).get("student", 0))
+        weighted_student = int(student_stats["student_conflicts"]) * student_weight
+        print(f"\n{'='*60}")
+        print("Final result (student_assignment):")
+        print(f"  Source XML       : {pathlib.Path(source_path).name}")
+        print(f"  Class total      : {base_cost['total']:.1f}")
+        print(f"  Student conflicts: {student_stats['student_conflicts']}  weighted={weighted_student}")
+        print(f"  Final total      : {final_cost['total']:.1f}")
+        print(f"  Valid            : {final_cost['valid']}")
+
+        validate = student_cfg.get("validate", False)
+        if validate and result_xml:
+            print(f"\nValidating {pathlib.Path(result_xml).name} against official validator ...")
+            try:
+                official = report_result(result_xml)
+                if official:
+                    print(f"Official total cost: {official['Total cost']}")
+            except Exception as e:
+                print(f"Validator unavailable: {e}")
+
+        return {
+            "instance": instance,
+            "status": "ok",
+            "method": method,
+            "pool_best": float(base_cost["total"]),
+            "total": float(final_cost["total"]),
+            "improvement_pct": 0.0,
+            "time": float(final_cost["time"]),
+            "room": float(final_cost["room"]),
+            "distribution": float(final_cost["distribution"]),
+            "valid": bool(final_cost.get("valid", True)),
+            "runtime_sec": round(time.time() - t0, 2),
+            "output_xml": str(result_xml or ""),
+            "student_conflicts": int(student_stats["student_conflicts"]),
+            "weighted_student": weighted_student,
+            "student_xml": str(result_xml or ""),
+            "source_xml": str(source_path),
+            "pool_size": int(pool_size),
+            "error": "",
+        }
+    except Exception as e:
+        print(f"\nInstance failed: {instance}: {e}")
+        return {
+            "instance": instance,
+            "status": "failed",
+            "method": method,
+            "pool_best": "",
+            "total": "",
+            "improvement_pct": "",
+            "time": "",
+            "room": "",
+            "distribution": "",
+            "valid": False,
+            "runtime_sec": round(time.time() - t0, 2),
+            "output_xml": "",
+            "student_conflicts": "",
+            "weighted_student": "",
+            "student_xml": "",
+            "source_xml": "",
+            "pool_size": "",
+            "error": str(e),
+        }
 
 
 def _repair_invalid_with_anchor(x, anchor_x, constraints, loader, evaluator, max_classes: int = None):
@@ -212,6 +364,9 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
     t0 = time.time()
     result_xml = None
     try:
+        if method == "student_assignment":
+            return run_student_assignment_instance(cfg, instance, data_dir, solutions_dir, output_dir)
+
         # -----------------------------------------------------------------------
         # Build constraint model (shared by all methods)
         # -----------------------------------------------------------------------
@@ -260,7 +415,7 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
             )
 
         else:
-            raise ValueError(f"Unknown method: {method}. Choices: merging, local_search, lns, tensor_search")
+            raise ValueError(f"Unknown method: {method}. Choices: merging, local_search, lns, tensor_search, student_assignment")
 
         student_stats = None
         student_xml = ""
@@ -319,6 +474,8 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
             "student_conflicts": "" if not student_stats else int(student_stats["student_conflicts"]),
             "weighted_student": "" if not student_stats else int(student_stats["student_conflicts"]) * int((reader.optimization or {}).get("student", 0)),
             "student_xml": str(student_xml or ""),
+            "source_xml": "",
+            "pool_size": "",
             "error": "",
         }
     except Exception as e:
@@ -339,6 +496,8 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
             "student_conflicts": "",
             "weighted_student": "",
             "student_xml": "",
+            "source_xml": "",
+            "pool_size": "",
             "error": str(e),
         }
     finally:
@@ -354,7 +513,7 @@ def write_batch_summary(rows: list, output_dir: pathlib.Path, method: str) -> pa
     fields = [
         "instance", "status", "method", "pool_best", "total", "improvement_pct",
         "time", "room", "distribution", "valid", "runtime_sec", "output_xml",
-        "student_conflicts", "weighted_student", "student_xml", "error",
+        "student_conflicts", "weighted_student", "student_xml", "source_xml", "pool_size", "error",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -394,7 +553,11 @@ def main():
     parser.add_argument("--data_folder", default=None, help="run every *.xml instance in this problem-data folder")
     parser.add_argument("--method",   default=None, help="override method")
     parser.add_argument("--device",   default=None, help="override device")
-    parser.add_argument("--student_assignment", action="store_true", help="enable final MARL-guided student assignment")
+    parser.add_argument(
+        "--student_assignment",
+        action="store_true",
+        help="run MARL-guided student assignment directly from existing solution XMLs",
+    )
     args = parser.parse_args()
 
     config_path = resolve_path(args.config)
@@ -407,6 +570,7 @@ def main():
     if args.data_folder:
         cfg["data_dir"] = args.data_folder
     if args.student_assignment:
+        cfg["method"] = "student_assignment"
         cfg.setdefault("student_assignment", {})["enabled"] = True
 
     method       = cfg.get("method", "merging")

@@ -8,7 +8,7 @@ device: cuda:0           # cuda:0 | cpu
 matrix: false            # matrix=False is lighter and enough for post-optimization
 
 # -----------------------------------------------------------------------
-method: merging          # merging | local_search | lns | tensor_search
+method: merging          # merging | local_search | lns | tensor_search | student_assignment
 # -----------------------------------------------------------------------
 
 merging:
@@ -82,6 +82,8 @@ tensor_search:
 student_assignment:
   enabled: false
   method: marl_guided
+  source: best_local      # best_local | first
+  source_xml: null        # optional explicit solution XML path
   iterations: 2
   max_bundles_per_course: 250
   candidate_limit: 40
@@ -92,3 +94,4 @@ student_assignment:
   conflict_weight: 1.0
   capacity_weight: 4.0
   worse_reward: 0.02
+  validate: false
