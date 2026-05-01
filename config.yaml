@@ -81,10 +81,24 @@ tensor_search:
 
 student_assignment:
   enabled: false
-  method: marl_guided
+  method: mip_lns_marl
   source: best_local      # best_local | first
   source_xml: null        # optional explicit solution XML path
-  iterations: 2
+  initial: mip            # mip | greedy
+  mip_solver: gurobi      # gurobi | scipy | auto
+  mip_fallback: true
+  mip_batch_size: 40
+  mip_candidate_limit: 8
+  mip_time_limit: 30.0
+  mip_rel_gap: 0.05
+  mip_max_variables: 250000
+  gurobi_threads: 0       # 0 lets Gurobi choose
+  gurobi_output: false
+  lns_iterations: 50
+  lns_destroy_students: 20
+  lns_candidate_limit: 10
+  post_marl_iterations: 0
+  iterations: 2           # used only when post_marl_iterations > 0
   max_bundles_per_course: 250
   candidate_limit: 40
   alpha: 0.25
