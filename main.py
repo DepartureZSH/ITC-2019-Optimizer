@@ -200,6 +200,120 @@ def run_student_assignment_instance(cfg: dict, instance: str, data_dir: pathlib.
         }
 
 
+def run_direct_solution_pool_lns_instance(cfg: dict, instance: str, data_dir: pathlib.Path,
+                                          solutions_dir: pathlib.Path, output_dir: pathlib.Path) -> dict:
+    """
+    Lightweight Phase 1B path.
+
+    This intentionally skips ConstraintsResolver.build_model(), because the direct
+    solution-pool repair operates on XML assignments and LocalValidator only.
+    It avoids the very expensive "Adding distribution constraints" stage.
+    """
+    method = cfg.get("method", "direct_lns")
+    t0 = time.time()
+    try:
+        from types import SimpleNamespace
+        from scripts.run_phase2_direct_solution_experiment import run_instance as run_direct_instance
+
+        direct_cfg = dict(cfg.get("direct_lns", {}))
+        if not direct_cfg:
+            # Backward-compatible fallback: the direct path uses a subset of LNS
+            # options, so an existing lns block can still drive this method.
+            direct_cfg = dict(cfg.get("lns", {}))
+
+        defaults = {
+            "max_iter": 35,
+            "destroy_size": 6,
+            "beam_width": 3,
+            "repair_candidate_limit": 16,
+            "mixed_high_distribution_prob": 0.9,
+            "seed": 20260427,
+        }
+        for key, value in defaults.items():
+            direct_cfg.setdefault(key, value)
+
+        args = SimpleNamespace(
+            data_dir=data_dir,
+            solutions_dir=solutions_dir,
+            output_dir=output_dir,
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        row = run_direct_instance(instance, args, direct_cfg)
+
+        if row.get("status") != "ok":
+            return {
+                "instance": instance,
+                "status": row.get("status", "failed"),
+                "method": method,
+                "pool_best": "",
+                "total": "",
+                "improvement_pct": "",
+                "time": "",
+                "room": "",
+                "distribution": "",
+                "valid": False,
+                "runtime_sec": round(time.time() - t0, 2),
+                "output_xml": str(row.get("output_xml", "")),
+                "student_conflicts": "",
+                "weighted_student": "",
+                "student_xml": "",
+                "source_xml": "",
+                "pool_size": row.get("solutions", ""),
+                "error": row.get("error", row.get("status", "")),
+            }
+
+        print(f"\n{'='*60}")
+        print("Final result (direct_lns):")
+        print(f"  Pool best      : {float(row['baseline_total']):.1f}")
+        print(f"  Direct LNS cost: {float(row['phase2_total']):.1f}")
+        print(f"  Improvement    : {float(row['improvement_pct']):+.2f}%")
+        print(f"  Valid          : {row.get('phase2_valid')}")
+        print(f"  Output XML     : {row.get('output_xml', '')}")
+
+        return {
+            "instance": instance,
+            "status": "ok",
+            "method": method,
+            "pool_best": float(row["baseline_total"]),
+            "total": float(row["phase2_total"]),
+            "improvement_pct": float(row["improvement_pct"]),
+            "time": float(row["phase2_time"]),
+            "room": float(row["phase2_room"]),
+            "distribution": float(row["phase2_distribution"]),
+            "valid": str(row.get("phase2_valid")) == "True",
+            "runtime_sec": round(time.time() - t0, 2),
+            "output_xml": str(row.get("output_xml", "")),
+            "student_conflicts": "",
+            "weighted_student": "",
+            "student_xml": "",
+            "source_xml": "",
+            "pool_size": int(row.get("solutions", 0) or 0),
+            "error": "",
+        }
+    except Exception as e:
+        print(f"\nInstance failed: {instance}: {e}")
+        return {
+            "instance": instance,
+            "status": "failed",
+            "method": method,
+            "pool_best": "",
+            "total": "",
+            "improvement_pct": "",
+            "time": "",
+            "room": "",
+            "distribution": "",
+            "valid": False,
+            "runtime_sec": round(time.time() - t0, 2),
+            "output_xml": "",
+            "student_conflicts": "",
+            "weighted_student": "",
+            "student_xml": "",
+            "source_xml": "",
+            "pool_size": "",
+            "error": str(e),
+        }
+
+
 def _repair_invalid_with_anchor(x, anchor_x, constraints, loader, evaluator, max_classes: int = None):
     """Try to make a hard-invalid pool member feasible by reverting hot classes to anchor."""
     scores = evaluator.local_validator.hard_violation_class_scores_from_x(x, constraints)
@@ -366,6 +480,8 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
     try:
         if method == "student_assignment":
             return run_student_assignment_instance(cfg, instance, data_dir, solutions_dir, output_dir)
+        if method in {"direct_lns", "solution_pool_lns", "direct_repair"}:
+            return run_direct_solution_pool_lns_instance(cfg, instance, data_dir, solutions_dir, output_dir)
 
         # -----------------------------------------------------------------------
         # Build constraint model (shared by all methods)
@@ -415,7 +531,10 @@ def run_instance(cfg: dict, instance: str, data_dir: pathlib.Path, solutions_dir
             )
 
         else:
-            raise ValueError(f"Unknown method: {method}. Choices: merging, local_search, lns, tensor_search, student_assignment")
+            raise ValueError(
+                f"Unknown method: {method}. Choices: merging, local_search, lns, "
+                "direct_lns, tensor_search, student_assignment"
+            )
 
         student_stats = None
         student_xml = ""

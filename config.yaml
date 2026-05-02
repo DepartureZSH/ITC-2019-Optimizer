@@ -8,7 +8,7 @@ device: cuda:0           # cuda:0 | cpu
 matrix: false            # matrix=False is lighter and enough for post-optimization
 
 # -----------------------------------------------------------------------
-method: merging          # merging | local_search | lns | tensor_search | student_assignment
+method: merging          # merging | local_search | lns | direct_lns | tensor_search | student_assignment
 # -----------------------------------------------------------------------
 
 merging:
@@ -56,6 +56,17 @@ lns:
   cooling: 0.995
   seed: 42
   validate: true
+
+direct_lns:
+  # Lightweight Phase 1B path: skips ConstraintsResolver.build_model() and
+  # operates directly on solution XMLs with LocalValidator.
+  max_iter: 35
+  destroy_size: 6
+  mixed_high_distribution_prob: 0.9
+  repair_method: beam
+  beam_width: 3
+  repair_candidate_limit: 16
+  seed: 20260427
 
 tensor_search:
   steps: 500
